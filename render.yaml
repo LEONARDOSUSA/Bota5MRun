@@ -1,0 +1,11 @@
+services:
+  - type: background
+    name: Botini5M
+    runtime: python
+    repo: https://github.com/LEONARDOSUSA/Botini5M
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app5M.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10
