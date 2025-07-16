@@ -1,0 +1,137 @@
+# Parte 1️⃣ — Imports y configuración básica
+import os
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+import pytz
+import requests
+import alpaca_trade_api as tradeapi
+
+from validadores import (
+    diagnostico_macd,
+    validar_sma,
+    cuerpo_dominante,
+    evaluar_calidad_senal,
+    verificar_claves_y_datos
+)
+
+# 🔐 Entorno y claves
+load_dotenv()
+ALPACA_KEY = os.getenv("ALPACA_KEY")
+ALPACA_SECRET = os.getenv("ALPACA_SECRET")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+BASE_URL = "https://paper-api.alpaca.markets"
+NY_TZ = pytz.timezone("America/New_York")
+# Parte 2️⃣ — Función para enviar mensaje por Telegram
+def enviar_mensaje(mensaje):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, data=data)
+    except Exception as e:
+        print(f"⚠️ Error al enviar mensaje: {e}")
+# 📡 Inicialización
+api = tradeapi.REST(ALPACA_KEY, ALPACA_SECRET, base_url=BASE_URL)
+tickers_activos = ["AAPL", "TSLA", "MSFT", "NVDA", "AMD", "SPY"]
+historial_senales = {}  # Protección por ticker/dirección
+# Parte 2️⃣ — Función para enviar mensaje por Telegram
+def enviar_mensaje(mensaje):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, data=data)
+    except Exception as e:
+        print(f"⚠️ Error al enviar mensaje: {e}")
+# Parte 3️⃣ — Evaluación técnica institucional por ticker
+def evaluar_ticker(ticker, fecha, momento):
+    inicio = momento - timedelta(minutes=6)
+    fin = momento - timedelta(minutes=3)
+    df_apertura = api.get_bars(ticker, "1Min", start=inicio.isoformat(), end=fin.isoformat()).df.tz_convert(NY_TZ)
+    df_apertura = df_apertura.tail(3)
+
+    if df_apertura.empty or len(df_apertura) < 3:
+        print(f"⛔ {ticker} ➝ velas insuficientes")
+        return
+
+    o, c = df_apertura["open"].values, df_apertura["close"].values
+    direccion = None
+    if c[0] > o[0] and c[1] > o[1] and c[2] > c[1] and c[2] > o[1]:
+        direccion = "CALL"
+    elif c[0] < o[0] and c[1] < o[1] and c[2] < c[1] and c[2] < o[1]:
+        direccion = "PUT"
+
+    print(f"📍 {ticker} ➝ Dirección: {direccion if direccion else '❌ No definida'}")
+    if not direccion:
+        return
+
+    # Protege duplicados recientes
+    histo = historial_senales.get(ticker)
+    if histo and histo["direccion"] == direccion and momento < histo["timestamp"] + timedelta(minutes=5):
+        print(f"⛔ {ticker} ➝ señal {direccion} ya enviada recientemente")
+        return
+
+    # SMA validación
+    df_1m = api.get_bars(ticker, "1Min", start=fin.isoformat(), end=momento.isoformat()).df.tz_convert(NY_TZ)
+    inicio_5m = momento - timedelta(minutes=60)
+    df_5m = api.get_bars(ticker, "5Min", start=inicio_5m.isoformat(), end=momento.isoformat()).df.tz_convert(NY_TZ)
+    sma_valida_1m = validar_sma(df_1m, direccion, "1Min")
+    sma_valida_5m = validar_sma(df_5m, direccion, "5Min")
+
+    # MACD multiframe
+    confirmados = sum([
+        diagnostico_macd(api, ticker, tf, momento, direccion, NY_TZ)
+        for tf in ["1Min", "5Min", "15Min"]
+    ])
+    print(f"📊 MACD ➝ {confirmados}/3")
+
+    if sma_valida_1m and sma_valida_5m and confirmados == 3:
+        vela_actual = df_1m.iloc[-1]
+        if not cuerpo_dominante(vela_actual, umbral=0.65):
+            print("⛔ Vela actual débil ➝ sin señal\n")
+            return
+
+        precio_senal = round(vela_actual["close"], 2)
+        calidad = evaluar_calidad_senal(api, ticker, fecha, direccion, momento, NY_TZ)
+
+        mensaje = f"""
+📡 *Señal institucional detectada*
+
+🔹 *Ticker:* `{ticker}`  
+🔹 *Dirección:* `{direccion}`  
+🔹 *Precio:* `${precio_senal}`  
+🔹 *MACD:* `{confirmados}/3 marcos`  
+🔹 *SMA:* `✅ Alineadas`  
+
+📊 *Diagnóstico:*  
+✔️ Patrón validado  
+✔️ Momentum institucional  
+✔️ Forma técnica confirmada  
+{calidad}
+"""
+        enviar_mensaje(mensaje)
+        historial_senales[ticker] = {"direccion": direccion, "timestamp": momento}
+        print("📨 Señal enviada\n")
+    else:
+        print("⛔ Condiciones incompletas ➝ sin señal\n")
+# Parte 4️⃣ — Ciclo principal de escaneo continuo
+if __name__ == "__main__":
+    print("🔐 Validando claves...")
+    if not verificar_claves_y_datos(ALPACA_KEY, ALPACA_SECRET):
+        print("⛔ Fallo en credenciales")
+        exit()
+
+    ahora = datetime.now(NY_TZ)
+    fecha = ahora.date()
+    momento = NY_TZ.localize(datetime.combine(fecha, datetime.strptime("09:36", "%H:%M").time()))
+    fin = NY_TZ.localize(datetime.combine(fecha, datetime.strptime("16:00", "%H:%M").time()))
+
+    print(f"✅ Escaneo táctico iniciado ➝ {fecha}\n")
+
+    while momento <= fin:
+        print(f"🕒 Escaneando @ {momento.strftime('%H:%M')} NY")
+        for ticker in tickers_activos:
+            evaluar_ticker(ticker, fecha, momento)
+        momento += timedelta(minutes=1)
+
+    print("🏁 Escaneo finalizado\n")
+
